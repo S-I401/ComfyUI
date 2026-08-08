@@ -1108,9 +1108,14 @@ def _quantized_apply(module, fn, recurse=True):
     for key, param in module._parameters.items():
         if param is None:
             continue
-        p = fn(param)
-        if (not torch.is_inference_mode_enabled()) and p.is_inference():
-            p = p.clone()
+        # fn (e.g. the .to(device) closure from Module.to()) must run with
+        # inference mode off: a tensor it produces while inference mode is
+        # active stays an inference tensor internally even once execution
+        # leaves this call's inference_mode scope (and even when the result's
+        # own is_inference() reports False), which breaks the nn.Parameter()
+        # wrap below on a later, unrelated prompt's model unload/reload.
+        with torch.inference_mode(False):
+            p = fn(param)
         module.register_parameter(key, torch.nn.Parameter(p, requires_grad=False))
     for key, buf in module._buffers.items():
         if buf is not None:

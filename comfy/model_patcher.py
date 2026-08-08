@@ -896,7 +896,15 @@ class ModelPatcher:
         inplace_update = self.weight_inplace_update or inplace_update
 
         if key not in self.backup and not return_weight:
-            self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
+            # Force this copy to happen outside inference mode: if `weight` is itself
+            # an inference tensor (e.g. a QuantizedTensor produced during an
+            # inference-mode-wrapped node execution), a copy taken while inference
+            # mode is still active stays an inference tensor internally even when
+            # its own is_inference() later reports False, which breaks restoring it
+            # via set_attr_param()'s nn.Parameter() wrap on unpatch.
+            with torch.inference_mode(False):
+                backup_weight = weight.to(device=self.offload_device, copy=inplace_update)
+            self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(backup_weight, inplace_update)
 
         temp_dtype = comfy.model_management.lora_compute_dtype(device_to) if key in self.patches else None
         if device_to is not None:
