@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import collections
+import functools
 import inspect
 import logging
 import math
@@ -46,6 +47,30 @@ import comfy_aimdo.model_vbar
 
 def is_model_patcher_output(output):
     return isinstance(output, ModelPatcher) or isinstance(getattr(output, "patcher", None), ModelPatcher)
+
+
+def _outside_inference_mode(fn):
+    """Run an entire model load/unload call outside torch.inference_mode().
+
+    ComfyUI's node execution always runs inside execution.py's
+    torch.inference_mode() block, so any tensor these methods create (weight
+    casts/copies, QuantizedTensor conversions, ...) would otherwise become an
+    inference tensor. That's harmless for tensors that stay local to one
+    node's output, but this machinery stores its results as long-lived
+    module state (nn.Parameter attributes) that a later, unrelated prompt's
+    model unload/reload needs to touch again -- and constructing an
+    nn.Parameter from an inference tensor raises "Cannot set version_counter
+    for inference tensor" at that point, regardless of what the tensor's own
+    is_inference() reports by then. Narrow, per-call inference_mode(False)
+    nesting around just the offending tensor op was found to be unreliable
+    for QuantizedTensor's dispatch-mediated ops, so the whole call is run
+    with inference mode off instead.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with torch.inference_mode(False):
+            return fn(*args, **kwargs)
+    return wrapper
 
 class PromptModelTracker:
     def __init__(self):
@@ -979,6 +1004,7 @@ class ModelPatcher:
                 loading.append(sort_criteria + (module_mem, n, m, params))
         return loading
 
+    @_outside_inference_mode
     def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
         with self.use_ejected():
             self.unpatch_hooks()
@@ -1110,6 +1136,7 @@ class ModelPatcher:
 
             self.apply_hooks(self.forced_hooks, force_apply=True)
 
+    @_outside_inference_mode
     def patch_model(self, device_to=None, lowvram_model_memory=0, load_weights=True, force_patch_weights=False):
         with self.use_ejected():
             for k in self.object_patches:
@@ -1127,6 +1154,7 @@ class ModelPatcher:
         self.inject_model()
         return self.model
 
+    @_outside_inference_mode
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         self.eject_model()
         if unpatch_weights:
@@ -1168,6 +1196,7 @@ class ModelPatcher:
 
         self.object_patches_backup.clear()
 
+    @_outside_inference_mode
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
         with self.use_ejected():
             hooks_unpatched = False
@@ -1253,6 +1282,7 @@ class ModelPatcher:
             logging.info("Unloaded partially: {:.2f} MB freed, {:.2f} MB remains loaded, {:.2f} MB buffer reserved, lowvram patches: {}".format(memory_freed / (1024 * 1024), self.model.model_loaded_weight_memory / (1024 * 1024), offload_buffer / (1024 * 1024), self.model.lowvram_patch_counter))
             return memory_freed
 
+    @_outside_inference_mode
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         with self.use_ejected(skip_and_inject_on_exit_only=True):
             unpatch_weights = self.model.current_weight_patches_uuid is not None and (self.model.current_weight_patches_uuid != self.patches_uuid or force_patch_weights)
